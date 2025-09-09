@@ -13,3 +13,5 @@ To be available soon.
 ## License:
 
 AudioReach Pipewire Plugin is licensed under the BSD-3-Clause. Check out the [LICENSE](LICENSE) for more details.
+
+
