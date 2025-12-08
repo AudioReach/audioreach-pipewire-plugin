@@ -38,6 +38,9 @@ PW_LOG_TOPIC_STATIC(log_topic, "log:" LOG_TAG);
 #define PW_DEFAULT_SAMPLE_RATE 48000
 #define PW_DEFAULT_SAMPLE_CHANNELS 2
 #define PW_DEFAULT_SAMPLE_POSITION "[ FL FR ]"
+#define PW_DEFAULT_BUFFER_DURATION_MS 25
+#define PW_LOW_LATENCY_BUFFER_DURATION_MS 5
+#define PW_DEEP_BUFFER_BUFFER_DURATION_MS 20
 
 struct pw_userdata {
     struct pw_context *context;
@@ -67,6 +70,11 @@ struct pw_userdata {
     bool isplayback;
     pal_stream_type_t stream_type;
     pal_device_id_t pal_device_id;
+
+    size_t source_buf_size;
+    size_t source_buf_count;
+    size_t sink_buf_size;
+    size_t sink_buf_count;
 };
 
 static void pw_pal_destroy_stream(void *d)
@@ -138,13 +146,13 @@ static void pw_pal_stream_start(struct pw_userdata *udata)
     if (udata->isplayback) {
         in_buf_cfg.buf_size = 0;
         in_buf_cfg.buf_count = 0;
-        out_buf_cfg.buf_size = 1024;
-        out_buf_cfg.buf_count = 4;
+        out_buf_cfg.buf_size = udata->sink_buf_size;
+        out_buf_cfg.buf_count = udata->sink_buf_count;
     } else {
         out_buf_cfg.buf_size = 0;
         out_buf_cfg.buf_count = 0;
-        in_buf_cfg.buf_size = 512;
-        in_buf_cfg.buf_count = 8;
+        in_buf_cfg.buf_size = udata->source_buf_size;
+        in_buf_cfg.buf_count = udata->source_buf_count;
     }
 
     rc = pal_stream_set_buffer_size(udata->stream_handle, &in_buf_cfg, &out_buf_cfg);
@@ -259,6 +267,7 @@ static void pw_pal_change_stream_param(void *data, uint32_t id, const struct spa
     spa_format_audio_raw_parse(param, &udata->format.info.raw);
 
 }
+
 static const struct pw_stream_events pw_pal_stream_events = {
     PW_VERSION_STREAM_EVENTS,
     .destroy = pw_pal_destroy_stream,
@@ -280,18 +289,19 @@ static int pw_pal_create_stream(struct pw_userdata *udata)
         udata->stream = pw_stream_new(udata->core, "example sink", udata->stream_props);
         params[n_params++] = spa_pod_builder_add_object(&b,
                         SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-                        SPA_PARAM_BUFFERS_buffers, SPA_POD_Int(4),
+                        SPA_PARAM_BUFFERS_buffers, SPA_POD_Int(udata->sink_buf_count),
                         SPA_PARAM_BUFFERS_blocks,  0,
-                        SPA_PARAM_BUFFERS_size,    SPA_POD_Int(1024),
-                        SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(16));
+                        SPA_PARAM_BUFFERS_size,    SPA_POD_Int(udata->sink_buf_size),
+                        SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(udata->frame_size));
+
     } else {
         udata->stream = pw_stream_new(udata->core, "example source", udata->stream_props);
         params[n_params++] = spa_pod_builder_add_object(&b,
                         SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-                        SPA_PARAM_BUFFERS_buffers, SPA_POD_Int(8),
+                        SPA_PARAM_BUFFERS_buffers, SPA_POD_Int(udata->source_buf_count),
                         SPA_PARAM_BUFFERS_blocks,  0,
-                        SPA_PARAM_BUFFERS_size,    SPA_POD_Int(512),
-                        SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(16));
+                        SPA_PARAM_BUFFERS_size,    SPA_POD_Int(udata->source_buf_size),
+                        SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(udata->frame_size));
     }
 
     if (udata->stream == NULL)
@@ -484,6 +494,25 @@ static void pw_pal_set_props(struct pw_userdata *udata, struct pw_properties *pr
     }
 }
 
+static size_t pw_stream_get_buffer_size(struct pw_userdata *udata, struct pal_media_config spec, pal_stream_type_t type)
+{
+        uint32_t buffer_duration = PW_DEFAULT_BUFFER_DURATION_MS;
+        size_t length = 0, frames = 0;
+        switch (type) {
+        case PAL_STREAM_DEEP_BUFFER:
+            buffer_duration = PW_DEEP_BUFFER_BUFFER_DURATION_MS;
+            break;
+        case PAL_STREAM_LOW_LATENCY:
+            buffer_duration = PW_LOW_LATENCY_BUFFER_DURATION_MS;
+        default:
+            break;
+        }
+
+        frames = spec.sample_rate * buffer_duration;
+        length = ((frames * udata->frame_size) / 1000);
+
+        return (length/udata->frame_size) * udata->frame_size;
+}
 static void pw_pal_fill_stream_info(struct pw_userdata *udata)
 {
     udata->stream_attributes = calloc(1, sizeof(struct pal_stream_attributes));
@@ -512,9 +541,11 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
                 break;
         }
 
-        udata->stream_attributes->out_media_config.ch_info.channels = 2;
+        udata->stream_attributes->out_media_config.ch_info.channels = udata->info.channels;
         udata->stream_attributes->out_media_config.ch_info.ch_map[0] = PAL_CHMAP_CHANNEL_FL;
         udata->stream_attributes->out_media_config.ch_info.ch_map[1] = PAL_CHMAP_CHANNEL_FR;
+        udata->sink_buf_size = pw_stream_get_buffer_size(udata, udata->stream_attributes->out_media_config, udata->stream_type);
+        udata->sink_buf_count = 4;
     } else {
         udata->stream_attributes->direction = PAL_AUDIO_INPUT;
         udata->stream_attributes->in_media_config.sample_rate = udata->info.rate;
@@ -532,9 +563,11 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
                 break;
         }
 
-        udata->stream_attributes->in_media_config.ch_info.channels = 2;
+        udata->stream_attributes->in_media_config.ch_info.channels = udata->info.channels;
         udata->stream_attributes->in_media_config.ch_info.ch_map[0] = PAL_CHMAP_CHANNEL_FL;
         udata->stream_attributes->in_media_config.ch_info.ch_map[1] = PAL_CHMAP_CHANNEL_FR;
+        udata->source_buf_size = 4096;
+        udata->source_buf_count = 2;
     }
 
     udata->pal_device = calloc(1, sizeof(struct pal_device));
