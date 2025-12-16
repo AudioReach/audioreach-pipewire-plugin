@@ -609,6 +609,53 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
     udata->pal_device->config.ch_info.ch_map[1] = PAL_CHMAP_CHANNEL_FR;
 }
 
+static int handle_headset_connection(struct pw_userdata *udata, bool connected)
+{
+    uint8_t buffer[128];
+    struct spa_pod_builder b;
+    struct spa_pod *props_param;
+    int ret;
+
+    if (udata == NULL || udata->stream == NULL) {
+        pw_log_error("%s: invalid arguments (udata/stream is NULL)", __func__);
+        return -EINVAL;
+    }
+
+    struct pw_properties *props = pw_properties_new(NULL);
+    if (props == NULL) {
+        pw_log_error("%s: pw_properties_new failed",__func__);
+        return -ENOMEM;
+    }
+
+    pw_properties_set(props, "jack.connected", connected ? "true" : "false");
+
+    ret = pw_stream_update_properties(udata->stream, &props->dict);
+    if (ret < 0) {
+        pw_log_error("%s: update_properties failed: %d (connected=%d)",__func__, ret, connected);
+        pw_properties_free(props);
+        return ret;
+    }
+    pw_properties_free(props);
+
+    b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+
+    props_param = spa_pod_builder_add_object(&b,
+        SPA_TYPE_OBJECT_Props, SPA_PARAM_Props
+    );
+
+    if (props_param == NULL) {
+        pw_log_error("%s: Failed to build Props param",__func__);
+        return -EINVAL;
+    }
+
+    ret = pw_stream_update_params(udata->stream, &props_param, 1);
+    if (ret < 0) {
+        pw_log_error("%s: update_params failed: %d",__func__, ret);
+        return ret;
+    }
+    return 0;
+}
+
 static int handle_device_connection(struct pw_userdata *udata, bool state)
 {
     int ret = 0;
@@ -650,6 +697,10 @@ static void on_jack_event(void *userdata, int fd, uint32_t mask)
 {
     struct pw_userdata *udata = userdata;
     char name[256] = {0,};
+    struct input_event ev;
+    bool connected;
+    int rc;
+
     ioctl(fd, EVIOCGNAME(sizeof(name)), name);
     if (!strstr(name, udata->jack_name))
         return;
@@ -660,16 +711,29 @@ static void on_jack_event(void *userdata, int fd, uint32_t mask)
         return;
     }
 
-    struct input_event ev;
     ssize_t ret = read(fd, &ev, sizeof(ev));
 
     if (ret == sizeof(ev)) {
-        if (ev.type == EV_SW) {
-            if (ev.code == SW_LINEOUT_INSERT) {
-                const char *state = ev.value ? "Connected" : "Disconnected";
-                pw_log_info("%s: %s", udata->jack_name, state);
-                if(handle_device_connection(udata, ev.value ? true : false))
-                    pw_log_error("Failed to handle device connection");
+        if (ev.type != EV_SW)
+            return;
+
+        if (ev.code == SW_LINEOUT_INSERT &&
+            strstr(udata->jack_name, "HDMI/DP") != NULL) {
+            const char *state = ev.value ? "Connected" : "Disconnected";
+            pw_log_info("HDMI/DP jack (%s): %s", udata->jack_name, state);
+
+            if (handle_device_connection(udata, ev.value ? true : false))
+                pw_log_error("Failed to handle HDMI/DP device connection");
+        }
+
+        else if ((ev.code == SW_HEADPHONE_INSERT || ev.code == SW_LINEOUT_INSERT) &&
+                 strstr(udata->jack_name, "Headset") != NULL) {
+            connected = ev.value ? true : false;
+            pw_log_info("Headset jack %s: %s", udata->jack_name, connected);
+
+            rc = handle_headset_connection(udata, connected);
+            if (rc < 0) {
+                pw_log_error("Failed to handle headset connection (connected=%d): %d", connected, rc);
             }
         }
     } else if (ret < 0) {
