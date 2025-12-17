@@ -70,7 +70,7 @@ struct pw_userdata {
     bool isplayback;
     pal_stream_type_t stream_type;
     pal_device_id_t pal_device_id;
-
+    bool is_offload;
     size_t source_buf_size;
     size_t source_buf_count;
     size_t sink_buf_size;
@@ -261,13 +261,13 @@ static void pw_pal_change_stream_param(void *data, uint32_t id, const struct spa
         return;
     if (spa_format_parse(param, &udata->format.media_type, &udata->format.media_subtype) < 0)
         return;
-    if (udata->format.media_type != SPA_MEDIA_TYPE_audio ||
-            udata->format.media_subtype != SPA_MEDIA_SUBTYPE_raw)
-            return;
-    spa_format_audio_raw_parse(param, &udata->format.info.raw);
-
+    if (udata->format.media_type == SPA_MEDIA_TYPE_audio &&
+        udata->format.media_subtype == SPA_MEDIA_SUBTYPE_raw) {
+        spa_format_audio_raw_parse(param, &udata->format.info.raw);
+    } else {
+        pw_log_info("Compressed format detected: subtype=%u", udata->format.media_subtype);
+    }
 }
-
 static const struct pw_stream_events pw_pal_stream_events = {
     PW_VERSION_STREAM_EVENTS,
     .destroy = pw_pal_destroy_stream,
@@ -287,13 +287,21 @@ static int pw_pal_create_stream(struct pw_userdata *udata)
     spa_pod_builder_init(&b, buffer, sizeof(buffer));
     if (udata->isplayback) {
         udata->stream = pw_stream_new(udata->core, "example sink", udata->stream_props);
-        params[n_params++] = spa_pod_builder_add_object(&b,
-                        SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-                        SPA_PARAM_BUFFERS_buffers, SPA_POD_Int(udata->sink_buf_count),
-                        SPA_PARAM_BUFFERS_blocks,  0,
-                        SPA_PARAM_BUFFERS_size,    SPA_POD_Int(udata->sink_buf_size),
-                        SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(udata->frame_size));
-
+        if (udata->is_offload) {
+            params[n_params++] = spa_pod_builder_add_object(&b,
+                            SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+                            SPA_PARAM_BUFFERS_buffers, SPA_POD_Int(udata->sink_buf_count),
+                            SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(0),
+                            SPA_PARAM_BUFFERS_size,    SPA_POD_Int(udata->sink_buf_size),
+                            SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(udata->frame_size));
+        } else {
+            params[n_params++] = spa_pod_builder_add_object(&b,
+                            SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+                            SPA_PARAM_BUFFERS_buffers, SPA_POD_Int(udata->sink_buf_count),
+                            SPA_PARAM_BUFFERS_blocks,  0,
+                            SPA_PARAM_BUFFERS_size,    SPA_POD_Int(udata->sink_buf_size),
+                            SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(udata->frame_size));
+        }
     } else {
         udata->stream = pw_stream_new(udata->core, "example source", udata->stream_props);
         params[n_params++] = spa_pod_builder_add_object(&b,
@@ -311,33 +319,32 @@ static int pw_pal_create_stream(struct pw_userdata *udata)
             &udata->stream_listener,
             &pw_pal_stream_events, udata);
 
-    params[n_params++] = spa_format_audio_raw_build(&b,
-            SPA_PARAM_EnumFormat, &udata->info);
-
-    if (udata->isplayback) {
-        if ((res = pw_stream_connect(udata->stream,
-                PW_DIRECTION_INPUT,
-                PW_ID_ANY,
-                PW_STREAM_FLAG_AUTOCONNECT |
-                PW_STREAM_FLAG_NO_CONVERT  |
-                PW_STREAM_FLAG_MAP_BUFFERS |
-                PW_STREAM_FLAG_RT_PROCESS,
-                params, n_params)) < 0)
-            return res;
-    }
-    else {
-        if ((res = pw_stream_connect(udata->stream,
-                PW_DIRECTION_OUTPUT,
-                PW_ID_ANY,
-                PW_STREAM_FLAG_AUTOCONNECT |
-                PW_STREAM_FLAG_NO_CONVERT  |
-                PW_STREAM_FLAG_MAP_BUFFERS |
-                PW_STREAM_FLAG_RT_PROCESS,
-                params, n_params)) < 0)
-            return res;
+    if (udata->is_offload) {
+        params[n_params++] =  spa_pod_builder_add_object(&b,
+                        SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+                        SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_audio),
+                        SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_mp3),
+                        SPA_FORMAT_AUDIO_format, SPA_POD_Id(SPA_AUDIO_FORMAT_ENCODED),
+                        SPA_FORMAT_AUDIO_rate, SPA_POD_Int(44100),
+                        SPA_FORMAT_AUDIO_channels, SPA_POD_Int(2));
+    } else {
+        params[n_params++] = spa_format_audio_raw_build(&b,
+                        SPA_PARAM_EnumFormat, &udata->info);
     }
 
-    return 0;
+    res = pw_stream_connect(udata->stream,
+              udata->isplayback ? PW_DIRECTION_INPUT : PW_DIRECTION_OUTPUT,
+              PW_ID_ANY,
+              PW_STREAM_FLAG_AUTOCONNECT |
+              PW_STREAM_FLAG_NO_CONVERT |
+              PW_STREAM_FLAG_MAP_BUFFERS |
+              PW_STREAM_FLAG_RT_PROCESS,
+              params, n_params);
+
+    if (udata->is_offload)
+        pw_stream_set_active(udata->stream, true);
+
+   return 0;
 }
 
 static void pw_pal_core_error(void *data, uint32_t id, int seq, int res, const char *message)
@@ -522,30 +529,35 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
     udata->stream_attributes->info.opt_stream_info.duration_us = -1;
     udata->stream_attributes->info.opt_stream_info.has_video = false;
     udata->stream_attributes->info.opt_stream_info.is_streaming = false;
-
     udata->stream_attributes->flags = 0;
     if (udata->isplayback) {
         udata->stream_attributes->direction = PAL_AUDIO_OUTPUT;
-        udata->stream_attributes->out_media_config.sample_rate = udata->info.rate;
         udata->stream_attributes->out_media_config.bit_width = 16;
-
-        switch (udata->stream_attributes->out_media_config.bit_width) {
-            case 32:
-                udata->stream_attributes->out_media_config.aud_fmt_id = PAL_AUDIO_FMT_PCM_S32_LE;
-                break;
-            case 24:
-                udata->stream_attributes->out_media_config.aud_fmt_id = PAL_AUDIO_FMT_PCM_S24_3LE;
-                break;
-            default:
-                udata->stream_attributes->out_media_config.aud_fmt_id = PAL_AUDIO_FMT_DEFAULT_PCM;
-                break;
-        }
-
-        udata->stream_attributes->out_media_config.ch_info.channels = udata->info.channels;
         udata->stream_attributes->out_media_config.ch_info.ch_map[0] = PAL_CHMAP_CHANNEL_FL;
         udata->stream_attributes->out_media_config.ch_info.ch_map[1] = PAL_CHMAP_CHANNEL_FR;
-        udata->sink_buf_size = pw_stream_get_buffer_size(udata, udata->stream_attributes->out_media_config, udata->stream_type);
         udata->sink_buf_count = 4;
+        if(!(udata->is_offload)) {
+            udata->stream_attributes->out_media_config.sample_rate = udata->info.rate;
+            switch (udata->stream_attributes->out_media_config.bit_width) {
+                case 32:
+                    udata->stream_attributes->out_media_config.aud_fmt_id = PAL_AUDIO_FMT_PCM_S32_LE;
+                    break;
+                case 24:
+                    udata->stream_attributes->out_media_config.aud_fmt_id = PAL_AUDIO_FMT_PCM_S24_3LE;
+                    break;
+                default:
+                    udata->stream_attributes->out_media_config.aud_fmt_id = PAL_AUDIO_FMT_DEFAULT_PCM;
+                    break;
+            }
+            udata->stream_attributes->out_media_config.ch_info.channels = udata->info.channels;
+            udata->sink_buf_size = pw_stream_get_buffer_size(udata, udata->stream_attributes->out_media_config, udata->stream_type);
+        } else {
+            udata->stream_attributes->flags  = PAL_STREAM_FLAG_NON_BLOCKING_MASK; /* required in PAL as this a non-blocking call*/
+            udata->stream_attributes->out_media_config.sample_rate = 44100 ;
+            udata->stream_attributes->out_media_config.ch_info.channels = 2;
+            udata->stream_attributes->out_media_config.aud_fmt_id = PAL_AUDIO_FMT_DEFAULT_COMPRESSED;
+            udata->sink_buf_size = 16484;
+        }
     } else {
         udata->stream_attributes->direction = PAL_AUDIO_INPUT;
         udata->stream_attributes->in_media_config.sample_rate = udata->info.rate;
@@ -587,6 +599,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 {
     struct pw_context *context = pw_impl_module_get_context(module);
     struct pw_properties *props = NULL;
+    const char *offload = NULL;
     uint32_t id = pw_global_get_id(pw_impl_module_get_global(module));
     uint32_t pid = getpid();
     struct pw_userdata *udata;
@@ -680,6 +693,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
     if ((str = pw_properties_get(props, "stream.props")) != NULL)
         pw_properties_update_string(udata->stream_props, str, strlen(str));
 
+    offload = pw_properties_get(udata->stream_props, "compress.offload");
+    udata->is_offload = offload && strcmp(offload, "true") == 0;
+
     pw_pal_set_props(udata, props, PW_KEY_AUDIO_RATE);
     pw_pal_set_props(udata, props, PW_KEY_AUDIO_CHANNELS);
     pw_pal_set_props(udata, props, SPA_KEY_AUDIO_POSITION);
@@ -691,14 +707,20 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
     pw_pal_set_props(udata, props, PW_KEY_MEDIA_CLASS);
 
     pw_pal_fetch_audio_info(udata->stream_props, &udata->info);
-
-    udata->frame_size = pw_pal_get_frame_size(&udata->info);
-    if (udata->frame_size == 0) {
-        res = -EINVAL;
-        pw_log_error( "can't parse audio format");
-        goto error;
+    if (!udata->is_offload) {
+        udata->frame_size = pw_pal_get_frame_size(&udata->info);
+        if (udata->frame_size == 0) {
+            res = -EINVAL;
+            pw_log_error( "can't parse audio format");
+            goto error;
+        }
+    } else {
+        udata->stream_type = PAL_STREAM_COMPRESSED;
+        udata->frame_size = 16;
+        pw_properties_set(udata->stream_props, PW_KEY_MEDIA_CLASS, "Audio/Sink");
+        pw_properties_set(udata->stream_props, PW_KEY_AUDIO_FORMAT, "encoded");
+        pw_properties_set(udata->stream_props, "audio.coding.format", "mp3");
     }
-
     udata->core = pw_context_get_object(udata->context, PW_TYPE_INTERFACE_Core);
     if (udata->core == NULL) {
         str = pw_properties_get(props, PW_KEY_REMOTE_NAME);
