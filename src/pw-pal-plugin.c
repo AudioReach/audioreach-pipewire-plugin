@@ -717,23 +717,19 @@ static void on_jack_event(void *userdata, int fd, uint32_t mask)
         if (ev.type != EV_SW)
             return;
 
-        if (ev.code == SW_LINEOUT_INSERT &&
-            strstr(udata->jack_name, "HDMI/DP") != NULL) {
+        if (ev.code == SW_LINEOUT_INSERT || ev.code == SW_HEADPHONE_INSERT) {
             const char *state = ev.value ? "Connected" : "Disconnected";
-            pw_log_info("HDMI/DP jack (%s): %s", udata->jack_name, state);
+            pw_log_info("Jack (%s): %s", udata->jack_name, state);
 
-            if (handle_device_connection(udata, ev.value ? true : false))
-                pw_log_error("Failed to handle HDMI/DP device connection");
-        }
-
-        else if ((ev.code == SW_HEADPHONE_INSERT || ev.code == SW_LINEOUT_INSERT) &&
-                 strstr(udata->jack_name, "Headset") != NULL) {
-            connected = ev.value ? true : false;
-            pw_log_info("Headset jack %s: %s", udata->jack_name, connected);
-
-            rc = handle_headset_connection(udata, connected);
-            if (rc < 0) {
-                pw_log_error("Failed to handle headset connection (connected=%d): %d", connected, rc);
+            if (strstr(udata->jack_name, "DP")) {
+                if (handle_device_connection(udata, ev.value ? true : false))
+                    pw_log_error("Failed to handle HDMI/DP device connection");
+            }
+            else if (strstr(udata->jack_name, "Headset")) {
+                rc = handle_headset_connection(udata, ev.value ? true : false);
+                if (rc < 0) {
+                    pw_log_error("Failed to handle headset connection (%d): %d", state, rc);
+                }
             }
         }
     } else if (ret < 0) {
