@@ -13,6 +13,8 @@
 #include <signal.h>
 #include <limits.h>
 #include <math.h>
+#include <dirent.h>
+#include <linux/input.h>
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
 #include <spa/utils/json.h>
@@ -31,6 +33,11 @@
 
 #define LOG_TAG "pw-pal-plugin"
 
+#define BITS_PER_BYTE 8
+#define NUM_BYTES ((SW_MAX + BITS_PER_BYTE) / BITS_PER_BYTE)
+#define BIT_VALUE(bit, array) \
+    ((array[(bit) / BITS_PER_BYTE] >> ((bit) % BITS_PER_BYTE)) & 1)
+
 PW_LOG_TOPIC_STATIC(log_topic, "log:" LOG_TAG);
 #define PW_LOG_TOPIC_DEFAULT log_topic
 
@@ -41,6 +48,9 @@ PW_LOG_TOPIC_STATIC(log_topic, "log:" LOG_TAG);
 #define PW_DEFAULT_BUFFER_DURATION_MS 25
 #define PW_LOW_LATENCY_BUFFER_DURATION_MS 5
 #define PW_DEEP_BUFFER_BUFFER_DURATION_MS 20
+#define MAX_NAME_LENGTH 20
+#define DEV_INPUT_DIR "/dev/input"
+#define FILE_PREFIX "event"
 
 struct pw_userdata {
     struct pw_context *context;
@@ -75,6 +85,9 @@ struct pw_userdata {
     size_t source_buf_count;
     size_t sink_buf_size;
     size_t sink_buf_count;
+
+    int jack_fd;
+    char jack_name[MAX_NAME_LENGTH];
 };
 
 static void pw_pal_destroy_stream(void *d)
@@ -379,6 +392,8 @@ static void pw_pal_userdata_destroy(struct pw_userdata *udata)
 {
     if (udata->stream)
         pw_stream_destroy(udata->stream);
+    if(fcntl(udata->jack_fd, F_GETFD) != 1 || errno != EBADF)
+        close(udata->jack_fd);
     if (udata->core && udata->do_disconnect)
         pw_core_disconnect(udata->core);
 
@@ -594,6 +609,204 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
     udata->pal_device->config.ch_info.ch_map[1] = PAL_CHMAP_CHANNEL_FR;
 }
 
+static int handle_headset_connection(struct pw_userdata *udata, bool connected)
+{
+    uint8_t buffer[128];
+    struct spa_pod_builder b;
+    struct spa_pod *props_param;
+    int ret;
+
+    if (udata == NULL || udata->stream == NULL) {
+        pw_log_error("%s: invalid arguments (udata/stream is NULL)", __func__);
+        return -EINVAL;
+    }
+
+    struct pw_properties *props = pw_properties_new(NULL);
+    if (props == NULL) {
+        pw_log_error("%s: pw_properties_new failed",__func__);
+        return -ENOMEM;
+    }
+
+    pw_properties_set(props, "jack.connected", connected ? "true" : "false");
+
+    ret = pw_stream_update_properties(udata->stream, &props->dict);
+    if (ret < 0) {
+        pw_log_error("%s: update_properties failed: %d (connected=%d)",__func__, ret, connected);
+        pw_properties_free(props);
+        return ret;
+    }
+    pw_properties_free(props);
+
+    b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+
+    props_param = spa_pod_builder_add_object(&b,
+        SPA_TYPE_OBJECT_Props, SPA_PARAM_Props
+    );
+
+    if (props_param == NULL) {
+        pw_log_error("%s: Failed to build Props param",__func__);
+        return -EINVAL;
+    }
+
+    ret = pw_stream_update_params(udata->stream, &props_param, 1);
+    if (ret < 0) {
+        pw_log_error("%s: update_params failed: %d",__func__, ret);
+        return ret;
+    }
+    return 0;
+}
+
+static int handle_device_connection(struct pw_userdata *udata, bool state)
+{
+    int ret = 0;
+    pal_param_device_connection_t *device_connection = (pal_param_device_connection_t *)
+        calloc(1, sizeof(pal_param_device_connection_t));
+    device_connection->connection_state = state;
+    device_connection->id = udata->pal_device_id;
+    ret = pal_set_param (PAL_PARAM_ID_DEVICE_CONNECTION, device_connection,
+            sizeof(pal_param_device_connection_t));
+    free(device_connection);
+    return ret;
+}
+
+
+static void handle_jack_boot_event(struct pw_userdata *udata)
+{
+    int fd = udata->jack_fd;
+    int connected = 0;
+    uint8_t sw_bitmask[NUM_BYTES];
+
+    memset(sw_bitmask, 0, sizeof(sw_bitmask));
+    // Query current switch state
+    if (ioctl(fd, EVIOCGSW(sizeof(sw_bitmask)), sw_bitmask) >= 0) {
+        // Check for HDMI/DP jack state
+        if (BIT_VALUE(SW_LINEOUT_INSERT, sw_bitmask))
+            connected = 1;
+
+        if (connected) {
+            pw_log_info("%s: Connected (boot time)", udata->jack_name);
+            if(handle_device_connection(udata, true))
+                pw_log_error("Failed to handle device connection");
+        }
+    } else {
+        pw_log_error("Failed to query initial jack state");
+    }
+}
+
+static void on_jack_event(void *userdata, int fd, uint32_t mask)
+{
+    struct pw_userdata *udata = userdata;
+    char name[256] = {0,};
+    struct input_event ev;
+    bool connected;
+    int rc;
+
+    ioctl(fd, EVIOCGNAME(sizeof(name)), name);
+    if (!strstr(name, udata->jack_name))
+        return;
+
+    if (mask & (SPA_IO_ERR | SPA_IO_HUP)) {
+        pw_log_error("error or hang-up on the hdmi/dp fd");
+        pw_main_loop_quit(pw_context_get_main_loop(udata->context));
+        return;
+    }
+
+    ssize_t ret = read(fd, &ev, sizeof(ev));
+
+    if (ret == sizeof(ev)) {
+        if (ev.type != EV_SW)
+            return;
+
+        if (ev.code == SW_LINEOUT_INSERT || ev.code == SW_HEADPHONE_INSERT) {
+            const char *state = ev.value ? "Connected" : "Disconnected";
+            pw_log_info("Jack (%s): %s", udata->jack_name, state);
+
+            if (strstr(udata->jack_name, "DP")) {
+                if (handle_device_connection(udata, ev.value ? true : false))
+                    pw_log_error("Failed to handle HDMI/DP device connection");
+            }
+            else if (strstr(udata->jack_name, "Headset")) {
+                rc = handle_headset_connection(udata, ev.value ? true : false);
+                if (rc < 0) {
+                    pw_log_error("Failed to handle headset connection (%d): %d", state, rc);
+                }
+            }
+        }
+    } else if (ret < 0) {
+        pw_log_error("Error reading event: %s", strerror(errno));
+    } else {
+        pw_log_error("Short read: got %zd bytes", ret);
+    }
+}
+
+static int jack_open_fd(struct pw_userdata *udata)
+{
+    int ret = 0;
+    DIR *d = opendir(DEV_INPUT_DIR);
+    if (d == NULL) {
+        pw_log_error("opendir() failed");
+        ret = -ENOENT;
+        goto exit;
+    }
+
+    struct dirent *dir;
+    while ((dir = readdir(d)) != NULL) {
+        /* Filter out non block devices and files that don't have
+           the right prefix. */
+        if (dir->d_type != DT_CHR ||
+                strncmp(FILE_PREFIX, dir->d_name,
+                    strlen(FILE_PREFIX)) != 0)
+            continue;
+
+        char filepath[512];
+        snprintf(filepath, sizeof(filepath), "%s/%s",
+            DEV_INPUT_DIR, dir->d_name);
+        int fd = open(filepath, O_RDONLY);
+        if (fd < 0) {
+            pw_log_error("open() failed %s", filepath);
+            continue;
+        }
+
+        char name[256] = {0,};
+        ioctl(fd, EVIOCGNAME(sizeof(name)), name);
+
+        /* Search for the keyword in the input's name. */
+        if (strstr(name, udata->jack_name) != NULL) {
+            closedir(d);
+            return fd;
+        }
+
+        close(fd);
+    }
+
+    closedir(d);
+    ret = -EINVAL;
+exit:
+    pw_log_error("No jack input device found in %s", DEV_INPUT_DIR);
+    return ret;
+}
+
+static int jack_register(struct pw_userdata *udata)
+{
+    int ret = 0;
+    udata->jack_fd = jack_open_fd(udata);
+    if (udata->jack_fd < 0) {
+        ret = -EBADFD;
+        goto exit;
+    }
+
+    ret = fcntl(udata->jack_fd, F_SETFL, O_NONBLOCK);
+    if (ret < 0) {
+        pw_log_error("fcntl() failed");
+        goto exit;
+    }
+
+    pw_loop_add_io(pw_context_get_main_loop(udata->context), udata->jack_fd,
+        SPA_IO_IN | SPA_IO_ERR | SPA_IO_HUP, true, on_jack_event, udata);
+exit:
+    return ret;
+}
+
 SPA_EXPORT
 int pipewire__module_init(struct pw_impl_module *module, const char *args)
 {
@@ -669,6 +882,10 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
             udata->pal_device_id = PAL_DEVICE_IN_SPEAKER_MIC;
         else if (strstr(value, "pal_source_headset_mic"))
             udata->pal_device_id = PAL_DEVICE_IN_WIRED_HEADSET;
+        else if (strstr(value, "pal_sink_dp_out"))
+            udata->pal_device_id = PAL_DEVICE_OUT_AUX_DIGITAL;
+        else if (strstr(value, "pal_sink_hdmi_out"))
+            udata->pal_device_id = PAL_DEVICE_OUT_HDMI;
     }
 
     if (pw_properties_get(props, PW_KEY_MEDIA_ROLE) == NULL)
@@ -695,6 +912,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
     offload = pw_properties_get(udata->stream_props, "compress.offload");
     udata->is_offload = offload && strcmp(offload, "true") == 0;
+
+    if ((str = pw_properties_get(props, "jack-name")) != NULL)
+        snprintf(udata->jack_name, sizeof(udata->jack_name), "%s", str);
 
     pw_pal_set_props(udata, props, PW_KEY_AUDIO_RATE);
     pw_pal_set_props(udata, props, PW_KEY_AUDIO_CHANNELS);
@@ -748,6 +968,13 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
     if ((res = pw_pal_create_stream(udata)) < 0)
         goto error;
     pw_impl_module_add_listener(module, &udata->module_listener, &pw_pal_events_module, udata);
+    if (udata->jack_name && udata->jack_name[0] != '\0') {
+        if(jack_register(udata))
+            pw_log_error("failed to register jack event for %s", udata->jack_name);
+        else {
+            handle_jack_boot_event(udata);
+        }
+    }
     return 0;
 
 error:

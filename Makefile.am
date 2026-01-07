@@ -18,7 +18,10 @@ install-exec-hook:
 install-data-hook:
 	mkdir -p $(DESTDIR)/usr/share/pipewire/pipewire.conf.d/
 	mkdir -p $(DESTDIR)/usr/share/wireplumber/wireplumber.conf.d/
+	mkdir -p $(DESTDIR)/usr/share/wireplumber/scripts/
 	$(INSTALL_DATA) $(srcdir)/configs/pw-pal-plugin.conf $(DESTDIR)/usr/share/pipewire/pipewire.conf.d/
 	$(INSTALL_DATA) $(srcdir)/configs/deep-buffer-combine-stream.conf $(DESTDIR)/usr/share/pipewire/pipewire.conf.d/
 	$(INSTALL_DATA) $(srcdir)/configs/low-latency-combine-stream.conf $(DESTDIR)/usr/share/pipewire/pipewire.conf.d/
 	$(INSTALL_DATA) $(srcdir)/configs/60-disable-alsa.conf $(DESTDIR)/usr/share/wireplumber/wireplumber.conf.d/
+	$(INSTALL_DATA) $(srcdir)/configs/90-device-detection.conf  $(DESTDIR)/usr/share/wireplumber/wireplumber.conf.d/
+	$(INSTALL_DATA) $(srcdir)/configs/90-device-detection.lua  $(DESTDIR)/usr/share/wireplumber/scripts/
