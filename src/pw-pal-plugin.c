@@ -614,7 +614,7 @@ static int handle_headset_connection(struct pw_userdata *udata, bool connected)
 {
     uint8_t buffer[128];
     struct spa_pod_builder b;
-    struct spa_pod *props_param;
+    const struct spa_pod *props_param;
     int ret;
 
     if (udata == NULL || udata->stream == NULL) {
@@ -622,7 +622,7 @@ static int handle_headset_connection(struct pw_userdata *udata, bool connected)
         return -EINVAL;
     }
 
-    struct pw_properties *props = pw_properties_new(NULL);
+    struct pw_properties *props = pw_properties_new(NULL, NULL);
     if (props == NULL) {
         pw_log_error("%s: pw_properties_new failed",__func__);
         return -ENOMEM;
