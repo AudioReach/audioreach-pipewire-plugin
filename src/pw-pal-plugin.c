@@ -86,6 +86,7 @@ struct pw_userdata {
     size_t sink_buf_size;
     size_t sink_buf_count;
 
+    struct spa_source *jack_src;
     int jack_fd;
     char jack_name[MAX_NAME_LENGTH];
 };
@@ -613,7 +614,7 @@ static int handle_headset_connection(struct pw_userdata *udata, bool connected)
 {
     uint8_t buffer[128];
     struct spa_pod_builder b;
-    struct spa_pod *props_param;
+    const struct spa_pod *props_param;
     int ret;
 
     if (udata == NULL || udata->stream == NULL) {
@@ -621,7 +622,7 @@ static int handle_headset_connection(struct pw_userdata *udata, bool connected)
         return -EINVAL;
     }
 
-    struct pw_properties *props = pw_properties_new(NULL);
+    struct pw_properties *props = pw_properties_new(NULL, NULL);
     if (props == NULL) {
         pw_log_error("%s: pw_properties_new failed",__func__);
         return -ENOMEM;
@@ -707,7 +708,13 @@ static void on_jack_event(void *userdata, int fd, uint32_t mask)
 
     if (mask & (SPA_IO_ERR | SPA_IO_HUP)) {
         pw_log_error("error or hang-up on the hdmi/dp fd");
-        pw_main_loop_quit(pw_context_get_main_loop(udata->context));
+        pw_loop_destroy_source(pw_context_get_main_loop(udata->context), udata->jack_src);
+        udata->jack_src = NULL;
+
+        if (udata->jack_fd >= 0) {
+            close(udata->jack_fd);
+            udata->jack_fd = -1;
+        }
         return;
     }
 
@@ -801,8 +808,14 @@ static int jack_register(struct pw_userdata *udata)
         goto exit;
     }
 
-    pw_loop_add_io(pw_context_get_main_loop(udata->context), udata->jack_fd,
-        SPA_IO_IN | SPA_IO_ERR | SPA_IO_HUP, true, on_jack_event, udata);
+    udata->jack_src = pw_loop_add_io(pw_context_get_main_loop(udata->context), udata->jack_fd,
+            SPA_IO_IN | SPA_IO_ERR | SPA_IO_HUP, true, on_jack_event, udata);
+
+    if (udata->jack_src == NULL) {
+        pw_log_error("pw_loop_add_io failed for jack_fd=%d", udata->jack_fd);
+        ret = -EIO;
+    }
+
 exit:
     return ret;
 }
