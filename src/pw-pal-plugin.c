@@ -245,26 +245,78 @@ static void pw_pal_process_stream(void *d)
             }
         }
     } else {
+        /* CAPTURE PATH (fixed): honor actual bytes read */
         data = bd->data;
-        size = buf->requested ? buf->requested * udata->frame_size : bd->maxsize;
+
+        uint32_t def_req = udata->source_buf_size ? udata->source_buf_size : bd->maxsize;
+        uint32_t req = buf->requested ? buf->requested * udata->frame_size : def_req;
+
+        /* cap to max and frame-align the request */
+        if (req > bd->maxsize) {
+            req = bd->maxsize;
+        }
+        if (udata->frame_size > 0) {
+            req -= (req % udata->frame_size);
+	}
 
         pal_buf.buffer = data;
-        pal_buf.size = size;
-        /* fill buffer contents here */
+        pal_buf.size = req;
+
+        uint32_t got = 0;
+        rc = 0;
+
         if (udata->stream_handle) {
-            if ((rc = pal_stream_read(udata->stream_handle, &pal_buf)) < 0) {
-                pw_log_error("Could not read data: %d %d", rc, __LINE__);
+            rc = pal_stream_read(udata->stream_handle, &pal_buf);
+            if (rc < 0) {
+                /* Non-blocking: no data available this cycle */
+                if (rc == -EAGAIN) {
+                    bd->chunk->size = 0;
+                    bd->chunk->stride = udata->frame_size;
+                    bd->chunk->offset = 0;
+                    buf->size = 0;
+                    pw_log_debug("capture: EAGAIN (no data), requested=%u", req);
+                    goto out_queue;
+                }
+                /* Other read failures: publish empty chunk this cycle */
+                pw_log_error("capture: pal_stream_read failed: %d", rc);
+                bd->chunk->size = 0;
+                bd->chunk->stride = udata->frame_size;
+                bd->chunk->offset = 0;
+                buf->size = 0;
+                goto out_queue;
+            }
+
+            /* Prefer pal_buf.size if PAL fills it, else rc if it's a positive byte count */
+            if (pal_buf.size > 0) {
+                got = pal_buf.size;
+            }
+            else if (rc > 0) {
+                got = (uint32_t)rc;
+            }
+            else {
+                got = 0;
+            }
+
+            /* clip to maxsize and frame-align */
+            if (got > bd->maxsize) {
+                got = bd->maxsize;
+            }
+            if (udata->frame_size > 0) {
+                got -= (got % udata->frame_size);
             }
         }
-        pw_log_error("read buffer data %p with up to %u bytes", data, size);
 
-        bd->chunk->size = size;
+        /* Update chunk with actual data read */
+        bd->chunk->size = got;
         bd->chunk->stride = udata->frame_size;
         bd->chunk->offset = 0;
-        buf->size = size / udata->frame_size;
-    }
-    /* write buffer contents here */
+        buf->size = (udata->frame_size > 0) ? (got / udata->frame_size) : 0;
 
+        pw_log_debug("capture: got=%u bytes, requested=%u, frames=%u", got, req, buf->size);
+    }
+
+out_queue:
+    /* write buffer contents here */
     pw_stream_queue_buffer(udata->stream, buf);
 }
 
@@ -594,8 +646,8 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
         udata->stream_attributes->in_media_config.ch_info.channels = udata->info.channels;
         udata->stream_attributes->in_media_config.ch_info.ch_map[0] = PAL_CHMAP_CHANNEL_FL;
         udata->stream_attributes->in_media_config.ch_info.ch_map[1] = PAL_CHMAP_CHANNEL_FR;
-        udata->source_buf_size = 4096;
-        udata->source_buf_count = 2;
+        udata->source_buf_size = pw_stream_get_buffer_size(udata, udata->stream_attributes->in_media_config, udata->stream_type);
+        udata->source_buf_count = 6;
     }
 
     udata->pal_device = calloc(1, sizeof(struct pal_device));
