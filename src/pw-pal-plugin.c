@@ -51,6 +51,7 @@ PW_LOG_TOPIC_STATIC(log_topic, "log:" LOG_TAG);
 #define MAX_NAME_LENGTH 20
 #define DEV_INPUT_DIR "/dev/input"
 #define FILE_PREFIX "event"
+#define MAX_DEVICES 4
 
 struct pw_userdata {
     struct pw_context *context;
@@ -79,7 +80,8 @@ struct pw_userdata {
     struct pal_stream_attributes *stream_attributes;
     bool isplayback;
     pal_stream_type_t stream_type;
-    pal_device_id_t pal_device_id;
+    pal_device_id_t pal_device_id[MAX_DEVICES];
+    uint32_t no_of_devices;
     bool is_offload;
     size_t source_buf_size;
     size_t source_buf_count;
@@ -148,8 +150,8 @@ static void pw_pal_stream_start(struct pw_userdata *udata)
 {
     int rc = 0;
     pal_buffer_config_t out_buf_cfg, in_buf_cfg;
-    rc = pal_stream_open(udata->stream_attributes, 1, udata->pal_device, 0, NULL, pa_pal_out_cb, (uint64_t)udata,
-            &udata->stream_handle);
+    rc = pal_stream_open(udata->stream_attributes, udata->no_of_devices, udata->pal_device,
+         0, NULL, pa_pal_out_cb, (uint64_t)udata, &udata->stream_handle);
 
     if (rc) {
         udata->stream_handle = NULL;
@@ -598,16 +600,18 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
         udata->source_buf_count = 2;
     }
 
-    udata->pal_device = calloc(1, sizeof(struct pal_device));
-    memset(udata->pal_device, 0, sizeof(struct pal_device));
+    udata->pal_device = calloc(udata->no_of_devices, sizeof(struct pal_device));
+    memset(udata->pal_device, 0, udata->no_of_devices * sizeof(struct pal_device));
 
-    udata->pal_device->id = udata->pal_device_id;
-    udata->pal_device->config.sample_rate = 48000;
-    udata->pal_device->config.bit_width = 16;
+    for(int i = 0; i < udata->no_of_devices; i++) {
+        udata->pal_device[i].id = udata->pal_device_id[i];
+        udata->pal_device[i].config.sample_rate = 48000;
+        udata->pal_device[i].config.bit_width = 16;
 
-    udata->pal_device->config.ch_info.channels = 2;
-    udata->pal_device->config.ch_info.ch_map[0] = PAL_CHMAP_CHANNEL_FL;
-    udata->pal_device->config.ch_info.ch_map[1] = PAL_CHMAP_CHANNEL_FR;
+        udata->pal_device[i].config.ch_info.channels = 2;
+        udata->pal_device[i].config.ch_info.ch_map[0] = PAL_CHMAP_CHANNEL_FL;
+        udata->pal_device[i].config.ch_info.ch_map[1] = PAL_CHMAP_CHANNEL_FR;
+    }
 }
 
 static inline bool pw_stream_is_running(struct pw_userdata *udata)
@@ -632,13 +636,19 @@ static int handle_device_connection(struct pw_userdata *udata, bool state)
     struct pal_device dev;
     if (!udata) return -EINVAL;
 
+    if (udata->no_of_devices != 1) {
+        pw_log_info("%s: combined playback selected, skip routing for jack '%s'",
+            __func__, udata->jack_name);
+        return 0;
+    }
+
     pw_log_info("%s: processing device connection for jack '%s'", __func__, udata->jack_name);
 
     if (strstr(udata->jack_name, "DP")) {
         pal_param_device_connection_t *device_connection = (pal_param_device_connection_t *)
             calloc(1, sizeof(pal_param_device_connection_t));
         device_connection->connection_state = state;
-        device_connection->id = udata->pal_device_id;
+        device_connection->id = udata->pal_device_id[0];
         ret = pal_set_param (PAL_PARAM_ID_DEVICE_CONNECTION, device_connection,
                 sizeof(pal_param_device_connection_t));
         free(device_connection);
@@ -866,28 +876,34 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
     if (value) {
         if (strstr(value, "Sink")) {
             udata->isplayback = true;
-            udata->pal_device_id = PAL_DEVICE_OUT_SPEAKER;
+            udata->pal_device_id[0] = PAL_DEVICE_OUT_SPEAKER;
         }
         else {
             udata->isplayback = false;
-            udata->pal_device_id = PAL_DEVICE_IN_SPEAKER_MIC;
+            udata->pal_device_id[0] = PAL_DEVICE_IN_SPEAKER_MIC;
         }
     }
 
+    udata->no_of_devices = 1;
     value = pw_properties_get(props, PW_KEY_NODE_NAME);
     if (value) {
         if (strstr(value, "pal_sink_speaker"))
-            udata->pal_device_id = PAL_DEVICE_OUT_SPEAKER;
+            udata->pal_device_id[0] = PAL_DEVICE_OUT_SPEAKER;
         else if (strstr(value, "pal_sink_headset"))
-            udata->pal_device_id = PAL_DEVICE_OUT_WIRED_HEADSET;
+            udata->pal_device_id[0] = PAL_DEVICE_OUT_WIRED_HEADSET;
         else if (strstr(value, "pal_source_speaker_mic"))
-            udata->pal_device_id = PAL_DEVICE_IN_SPEAKER_MIC;
+            udata->pal_device_id[0] = PAL_DEVICE_IN_SPEAKER_MIC;
         else if (strstr(value, "pal_source_headset_mic"))
-            udata->pal_device_id = PAL_DEVICE_IN_WIRED_HEADSET;
+            udata->pal_device_id[0] = PAL_DEVICE_IN_WIRED_HEADSET;
         else if (strstr(value, "pal_sink_dp_out"))
-            udata->pal_device_id = PAL_DEVICE_OUT_AUX_DIGITAL;
+            udata->pal_device_id[0] = PAL_DEVICE_OUT_AUX_DIGITAL;
         else if (strstr(value, "pal_sink_hdmi_out"))
-            udata->pal_device_id = PAL_DEVICE_OUT_HDMI;
+            udata->pal_device_id[0] = PAL_DEVICE_OUT_HDMI;
+        else if (strstr(value, "pal_sink_combined")) {
+            udata->pal_device_id[0] = PAL_DEVICE_OUT_WIRED_HEADSET;
+            udata->pal_device_id[1] = PAL_DEVICE_OUT_SPEAKER;
+            udata->no_of_devices = 2;
+        }
     }
 
     if (pw_properties_get(props, PW_KEY_MEDIA_ROLE) == NULL)
