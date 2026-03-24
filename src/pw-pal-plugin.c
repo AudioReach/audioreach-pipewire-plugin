@@ -594,8 +594,8 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
         udata->stream_attributes->in_media_config.ch_info.channels = udata->info.channels;
         udata->stream_attributes->in_media_config.ch_info.ch_map[0] = PAL_CHMAP_CHANNEL_FL;
         udata->stream_attributes->in_media_config.ch_info.ch_map[1] = PAL_CHMAP_CHANNEL_FR;
-        udata->source_buf_size = 4096;
-        udata->source_buf_count = 2;
+        udata->source_buf_size = 512;
+        udata->source_buf_count = 8;
     }
 
     udata->pal_device = calloc(1, sizeof(struct pal_device));
