@@ -1,33 +1,23 @@
 Source: audioreach-pipewire-plugin
 Section: misc
 Priority: optional
-Maintainer: Saurav Kumar <sauravk@qti.qualcomm.com>
+Maintainer: Radhika Garg <radhgarg@qti.qualcomm.com>
 Rules-Requires-Root: no
 Build-Depends:
  debhelper-compat (= 13),
+ git,
+ libssl-dev,
+ ca-certificates,
  pkg-config,
- libpipewire-0.3-dev,
- libspa-0.2-dev,
- wireplumber,
- pipewire,
- audioreach-pal,
- audioreach-pal-headers-dev,
+ autotools-dev,
  audioreach-graphmgr,
- audioreach-graphmgr-dev,
- libexpat1-dev,
+ audioreach-pal, 
+ audioreach-pal-headers
 Standards-Version: 4.6.2
-Homepage: https://github.com/AudioReach/audioreach-pipewire-plugin
 
 Package: audioreach-pipewire-plugin
 Architecture: arm64
 Depends:
- ${shlibs:Depends},
- ${misc:Depends},
- libpipewire-0.3-dev,
- libspa-0.2-dev,
- wireplumber,
- pipewire,
- audioreach-pal,
- audioreach-graphmgr,
- libexpat1-dev,
-Description: PipeWire PAL Plugin Package.
+ ${misc:Depends}
+Description: Qualcomm pal audio stack development headers
+
