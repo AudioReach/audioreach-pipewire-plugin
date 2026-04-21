@@ -85,6 +85,9 @@ jobs:
   trigger_lava:
     needs: [ process_image, filter_test_matrix ]
     uses: Audioreach/audioreach-workflows/.github/workflows/test.yml@temp
+    permissions:
+      checks: write
+      pull-requests: write
     secrets: inherit
     with:
       build_matrix: ${{ needs.filter_test_matrix.outputs.test_matrix }}
