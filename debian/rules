@@ -1,8 +1,13 @@
 #!/usr/bin/make -f
 
 %:
-		dh $@
+	dh $@
 
-override_dh_auto_install:
-		dh_auto_install -- DESTDIR=$(CURDIR)/debian/tmp
-		rm $(CURDIR)/debian/tmp/usr/lib/*/*.la
+
+override_dh_auto_configure:
+	dh_auto_configure -- --prefix=/usr
+
+override_dh_auto_build:
+	git clone https://github.com/AudioReach/audioreach-pipewire-plugin.git audioreach-pipewire-plugin
+	cd audioreach-pipewire-plugin && git checkout master
+
