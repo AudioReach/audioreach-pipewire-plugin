@@ -24,6 +24,7 @@
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/audio/raw.h>
 #include <spa/param/buffers.h>
+#include <spa/param/audio/compressed.h>
 #include <pipewire/impl.h>
 #include <pipewire/i18n.h>
 #include <PalApi.h>
@@ -83,10 +84,19 @@ struct pw_userdata {
     pal_device_id_t pal_device_id[MAX_DEVICES];
     uint32_t no_of_devices;
     bool is_offload;
+
+    pal_audio_fmt_t  codec_aud_fmt_id;
+    uint32_t         codec_spa_subtype;
+    uint32_t         codec_sample_rate;
+    uint32_t         codec_channels;
+    uint32_t         codec_bit_rate;
+
     size_t source_buf_size;
     size_t source_buf_count;
     size_t sink_buf_size;
     size_t sink_buf_count;
+    bool pal_ready;
+    bool pal_wait_logged;
 
     struct spa_source *jack_src;
     int jack_fd;
@@ -104,6 +114,13 @@ static void pw_pal_destroy_stream(void *d)
 static int32_t pa_pal_out_cb(pal_stream_handle_t *stream_handle,
                             uint32_t event_id, uint32_t *event_data,
                             uint32_t event_size, uint64_t cookie) {
+    struct pw_userdata *udata = (struct pw_userdata *)cookie;
+
+    if (udata == NULL)
+        return 0;
+
+    udata->pal_ready = true;
+    udata->pal_wait_logged = false;
 
     return 0;
 }
@@ -132,6 +149,11 @@ static int close_pal_stream(struct pw_userdata *udata)
     int rc = -1;
 
     if (udata->stream_handle) {
+        pw_log_error("close_pal_stream enter: handle=%p offload=%d pal_ready=%d wait_logged=%d",
+                udata->stream_handle, udata->is_offload, udata->pal_ready,
+                udata->pal_wait_logged);
+        udata->pal_ready = false;
+        udata->pal_wait_logged = false;
         rc = pal_stream_stop(udata->stream_handle);
         if (rc) {
             pw_log_error("pal_stream_stop failed for %p error %d", udata->stream_handle, rc);
@@ -150,6 +172,9 @@ static void pw_pal_stream_start(struct pw_userdata *udata)
 {
     int rc = 0;
     pal_buffer_config_t out_buf_cfg, in_buf_cfg;
+    udata->pal_ready = false;
+    udata->pal_wait_logged = false;
+
     rc = pal_stream_open(udata->stream_attributes, udata->no_of_devices, udata->pal_device,
          0, NULL, pa_pal_out_cb, (uint64_t)udata, &udata->stream_handle);
 
@@ -185,6 +210,10 @@ static void pw_pal_stream_start(struct pw_userdata *udata)
         pw_log_error("pal_stream_start set volume, error %d\n", rc);
         pw_pal_set_volume(udata, 1.0);
     }
+    if (!udata->is_offload)
+        udata->pal_ready = true;
+    else
+        pw_log_info("PAL compressed stream started; waiting for write-ready callback");
 
     return;
 cleanup:
@@ -241,9 +270,28 @@ static void pw_pal_process_stream(void *d)
         pal_buf.buffer = data;
         pal_buf.size = size;
 
-        if (udata->stream_handle) {
-            if ((rc = pal_stream_write(udata->stream_handle, &pal_buf)) < 0) {
-                pw_log_error("Could not write data: %d %d", rc, __LINE__);
+        if (udata->stream_handle && size > 0) {
+            if (udata->is_offload && !udata->pal_ready) {
+                if (!udata->pal_wait_logged) {
+                    pw_log_info("PAL compressed stream has no write-ready callback yet; attempting initial write");
+                    udata->pal_wait_logged = true;
+                }
+            }
+            
+            rc = pal_stream_write(udata->stream_handle, &pal_buf);
+            if (udata->is_offload)
+                pw_log_info("PAL compressed write returned: rc=%d, requested bytes=%u, pal_ready=%d", rc, size, udata->pal_ready);
+
+            if (rc < 0) {
+                pw_log_error("pal_stream_write failed: %d", rc);
+                if (udata->is_offload) {
+                    udata->pal_ready = false;
+                    udata->pal_wait_logged = false;
+                }
+                close_pal_stream(udata);
+            } else {
+                size_t written = (size_t)rc;
+                buf->size = written / udata->frame_size;
             }
         }
     } else {
@@ -267,6 +315,7 @@ static void pw_pal_process_stream(void *d)
     }
     /* write buffer contents here */
 
+done:
     pw_stream_queue_buffer(udata->stream, buf);
 }
 
@@ -307,7 +356,7 @@ static int pw_pal_create_stream(struct pw_userdata *udata)
             params[n_params++] = spa_pod_builder_add_object(&b,
                             SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
                             SPA_PARAM_BUFFERS_buffers, SPA_POD_Int(udata->sink_buf_count),
-                            SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(0),
+                            SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
                             SPA_PARAM_BUFFERS_size,    SPA_POD_Int(udata->sink_buf_size),
                             SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(udata->frame_size));
         } else {
@@ -336,13 +385,28 @@ static int pw_pal_create_stream(struct pw_userdata *udata)
             &pw_pal_stream_events, udata);
 
     if (udata->is_offload) {
-        params[n_params++] =  spa_pod_builder_add_object(&b,
-                        SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
-                        SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_audio),
-                        SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_mp3),
-                        SPA_FORMAT_AUDIO_format, SPA_POD_Id(SPA_AUDIO_FORMAT_ENCODED),
-                        SPA_FORMAT_AUDIO_rate, SPA_POD_Int(44100),
-                        SPA_FORMAT_AUDIO_channels, SPA_POD_Int(2));
+        struct spa_audio_info codec_info;
+
+        spa_zero(codec_info);
+        codec_info.media_type = SPA_MEDIA_TYPE_audio;
+        codec_info.media_subtype = udata->codec_spa_subtype;
+
+        if (udata->codec_spa_subtype == SPA_MEDIA_SUBTYPE_mp3) {
+            codec_info.info.mp3.rate = udata->codec_sample_rate;
+            codec_info.info.mp3.channels = udata->codec_channels;
+            codec_info.info.mp3.channel_mode =
+                udata->codec_channels == 1 ?
+                SPA_AUDIO_MP3_CHANNEL_MODE_MONO :
+                SPA_AUDIO_MP3_CHANNEL_MODE_STEREO;
+        } else if (udata->codec_spa_subtype == SPA_MEDIA_SUBTYPE_aac) {
+            codec_info.info.aac.rate = udata->codec_sample_rate;
+            codec_info.info.aac.channels = udata->codec_channels;
+            codec_info.info.aac.bitrate = udata->codec_bit_rate;
+            codec_info.info.aac.stream_format = SPA_AUDIO_AAC_STREAM_FORMAT_MP4ADTS;
+        }
+
+        params[n_params++] = spa_format_audio_build(&b,
+                        SPA_PARAM_EnumFormat, &codec_info);
     } else {
         params[n_params++] = spa_format_audio_raw_build(&b,
                         SPA_PARAM_EnumFormat, &udata->info);
@@ -570,10 +634,10 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
             udata->stream_attributes->out_media_config.ch_info.channels = udata->info.channels;
             udata->sink_buf_size = pw_stream_get_buffer_size(udata, udata->stream_attributes->out_media_config, udata->stream_type);
         } else {
-            udata->stream_attributes->flags  = PAL_STREAM_FLAG_NON_BLOCKING_MASK; /* required in PAL as this a non-blocking call*/
-            udata->stream_attributes->out_media_config.sample_rate = 44100 ;
-            udata->stream_attributes->out_media_config.ch_info.channels = 2;
-            udata->stream_attributes->out_media_config.aud_fmt_id = PAL_AUDIO_FMT_DEFAULT_COMPRESSED;
+            udata->stream_attributes->flags  = PAL_STREAM_FLAG_NON_BLOCKING_MASK;
+            udata->stream_attributes->out_media_config.sample_rate      = udata->codec_sample_rate;
+            udata->stream_attributes->out_media_config.ch_info.channels = udata->codec_channels;
+            udata->stream_attributes->out_media_config.aud_fmt_id       = udata->codec_aud_fmt_id;
             udata->sink_buf_size = 16484;
         }
     } else {
@@ -819,6 +883,27 @@ exit:
     return ret;
 }
 
+static bool pw_pal_codec_type_to_pal(const char *s, pal_audio_fmt_t *f, uint32_t *t) {
+    if (!s) return false;
+    if (strcasecmp(s,"mp3")==0)      { *f=PAL_AUDIO_FMT_MP3;      *t=SPA_MEDIA_SUBTYPE_mp3;    return true; }
+    if (strcasecmp(s,"aac")==0||strcasecmp(s,"aac_adts")==0) { *f=PAL_AUDIO_FMT_AAC_ADTS; *t=SPA_MEDIA_SUBTYPE_aac; return true; }
+    if (strcasecmp(s,"aac_adif")==0) { *f=PAL_AUDIO_FMT_AAC_ADIF; *t=SPA_MEDIA_SUBTYPE_aac;    return true; }
+    if (strcasecmp(s,"aac_latm")==0) { *f=PAL_AUDIO_FMT_AAC_LATM; *t=SPA_MEDIA_SUBTYPE_aac;    return true; }
+    if (strcasecmp(s,"flac")==0)     { *f=PAL_AUDIO_FMT_FLAC;     *t=SPA_MEDIA_SUBTYPE_flac;   return true; }
+    if (strcasecmp(s,"vorbis")==0)   { *f=PAL_AUDIO_FMT_VORBIS;   *t=SPA_MEDIA_SUBTYPE_vorbis; return true; }
+    if (strcasecmp(s,"opus")==0)     { *f=PAL_AUDIO_FMT_OPUS;     *t=SPA_MEDIA_SUBTYPE_opus;   return true; }
+    if (strcasecmp(s,"wma")==0||strcasecmp(s,"wma_std")==0) { *f=PAL_AUDIO_FMT_WMA_STD; *t=SPA_MEDIA_SUBTYPE_wma; return true; }
+    if (strcasecmp(s,"wma_pro")==0)  { *f=PAL_AUDIO_FMT_WMA_PRO;  *t=SPA_MEDIA_SUBTYPE_wma;    return true; }
+    return false;
+}
+
+static uint32_t pw_pal_get_u32(const struct pw_properties *p, const char *k, uint32_t d) {
+    const char *s = pw_properties_get(p, k);
+    if (!s) return d;
+    char *e; unsigned long v = strtoul(s, &e, 10);
+    return (e==s||*e) ? d : (uint32_t)v;
+}
+
 SPA_EXPORT
 int pipewire__module_init(struct pw_impl_module *module, const char *args)
 {
@@ -953,11 +1038,21 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
             goto error;
         }
     } else {
+        udata->codec_aud_fmt_id=PAL_AUDIO_FMT_MP3; udata->codec_spa_subtype=SPA_MEDIA_SUBTYPE_mp3;
+        udata->codec_sample_rate=48000; udata->codec_channels=2; udata->codec_bit_rate=128000;
+        const char *cs = pw_properties_get(udata->stream_props, "codec.type");
+        if (!pw_pal_codec_type_to_pal(cs, &udata->codec_aud_fmt_id, &udata->codec_spa_subtype))
+            pw_log_info("codec.type unknown, defaulting to MP3");
+        udata->codec_sample_rate = pw_pal_get_u32(udata->stream_props, "codec.sample_rate", udata->codec_sample_rate);
+        udata->codec_channels    = pw_pal_get_u32(udata->stream_props, "codec.channels",    udata->codec_channels);
+        udata->codec_bit_rate    = pw_pal_get_u32(udata->stream_props, "codec.bit_rate",    udata->codec_bit_rate);
+        pw_log_info("compress offload: codec=%s aud_fmt=0x%x rate=%u ch=%u",
+                cs?cs:"mp3", udata->codec_aud_fmt_id, udata->codec_sample_rate, udata->codec_channels);
         udata->stream_type = PAL_STREAM_COMPRESSED;
         udata->frame_size = 16;
         pw_properties_set(udata->stream_props, PW_KEY_MEDIA_CLASS, "Audio/Sink");
         pw_properties_set(udata->stream_props, PW_KEY_AUDIO_FORMAT, "encoded");
-        pw_properties_set(udata->stream_props, "audio.coding.format", "mp3");
+        pw_properties_set(udata->stream_props, "audio.coding.format", cs?cs:"mp3");
     }
     udata->core = pw_context_get_object(udata->context, PW_TYPE_INTERFACE_Core);
     if (udata->core == NULL) {
