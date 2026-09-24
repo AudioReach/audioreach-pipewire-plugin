@@ -3,7 +3,7 @@
 # Requires autoconf tool later than 2.61
 AC_PREREQ(2.69)
 # Initialize the smwrapper package version 1.0.0
-AC_INIT([pw-pal],1.0.0)
+AC_INIT([pw-pal],1.0.1)
 # Does not strictly follow GNU Coding standards
 AM_INIT_AUTOMAKE([foreign subdir-objects])
 
