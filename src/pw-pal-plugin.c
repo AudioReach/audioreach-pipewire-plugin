@@ -186,7 +186,7 @@ static void *pw_pal_reader_thread(void *arg)
     uint8_t *tmp;
     uint32_t buf_size = udata->source_buf_size;
 
-    tmp = malloc(buf_size);
+    tmp = calloc(1, buf_size);
     if (!tmp) {
         pw_log_error("reader thread: malloc failed");
         return NULL;
@@ -590,7 +590,7 @@ static int sva_load_sound_model(struct pw_userdata *udata)
         udata->sva_cfg.model_data = NULL;
     }
 
-    udata->sva_cfg.model_data = malloc(udata->sva_cfg.model_size);
+    udata->sva_cfg.model_data = calloc(1, udata->sva_cfg.model_size);
     if (!udata->sva_cfg.model_data) return -ENOMEM;
 
     fp = fopen(udata->sva_cfg.model_path, "rb");
