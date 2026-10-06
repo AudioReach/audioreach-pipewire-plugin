@@ -11,6 +11,14 @@ local default_metadata
 local last_known_sink, last_known_source
 local pending_metadata_write = { key = nil, name = nil }
 
+-- Nodes that carry compress-offload streams and must NEVER be
+-- remapped by jack-plug/unplug events.
+-- pal_sink_speaker_compress is the PAL compress node; its routing is
+-- set by target.object in module-compress-offload-sink, not here.
+local COMPRESS_NODES = {
+    pal_sink_speaker_compress = true,
+}
+
 local DEVICE_MAPPINGS = {
     connected = {
         ["Audio/Sink"] = {
@@ -160,7 +168,10 @@ local function register_metadata_change_hook()
                changed_key == "default.configured.audio.sink" then
 
                 local current_sink = get_current_default(default_metadata, true)
-                if current_sink and current_sink ~= "Spa:String:JSON" then
+                -- Do not track compress nodes as the "last known" default:
+                -- they are managed exclusively by target.object routing.
+                if current_sink and current_sink ~= "Spa:String:JSON" and
+                   not COMPRESS_NODES[current_sink] then
                     last_known_sink = current_sink
                     log:warning("Updated last known sink to: " .. last_known_sink)
                 end
@@ -212,6 +223,15 @@ local function register_jack_hook()
             local jack_connected = props["jack.connected"]
             local media_class    = props["media.class"] or ""
 
+            -- Compress-offload nodes are never subject to jack-based
+            -- device switching.  Their routing is owned by
+            -- target.object routing in module-compress-offload-sink.
+            if COMPRESS_NODES[name] then
+                log:warning("Skipping compress-offload node " .. name ..
+                            " from jack routing")
+                return
+            end
+
             if jack_connected == nil then
                 log:warning("jack.connected is nil, skipping " .. name)
                 return
@@ -232,6 +252,13 @@ local function register_jack_hook()
                         (is_sink and "sink" or "source") ..
                         ": " .. tostring(current_default))
 
+            -- If the current default is a compress node, do not disturb it.
+            if current_default and COMPRESS_NODES[current_default] then
+                log:warning("Current default is compress node " .. current_default ..
+                            "; skipping jack remap")
+                return
+            end
+
             if is_sink then
                 local cur_ll  = current_default and current_default:find("_ll") ~= nil
                 local cur_db  = current_default and current_default:find("_db") ~= nil
@@ -244,29 +271,25 @@ local function register_jack_hook()
                 end
             end
 
-            local class_key        = is_sink and "Audio/Sink" or "Audio/Source"
+            local class_key         = is_sink and "Audio/Sink" or "Audio/Source"
             local mappings_by_state = DEVICE_MAPPINGS[jack_state]
             local class_mappings    = mappings_by_state and mappings_by_state[class_key]
 
             local base_default = is_sink and last_known_sink or last_known_source
             log:warning("Base default for " .. class_key .. ": " .. tostring(base_default))
 
-            -- Determine mapping for the *current* default
             local mapped = nil
             if class_mappings and base_default then
                 mapped = class_mappings[base_default]
             end
 
             if base_default and not mapped then
-                -- Case 1: we *do* have a current default, but it is NOT in the mapping.
-                -- This is your “unmapped” case (e.g. pal_sink_speaker_compress).
-                -- Do NOT change the default on headset plug/unplug.
+                -- base_default is not in the mapping table (e.g. a future
+                -- non-compress, non-ll/db node).  Keep the existing default.
                 log:warning(
                     "No mapping for base_default=" .. tostring(base_default) ..
                     " in state=" .. jack_state .. "; keeping existing default"
                 )
-
-                -- You can still activate the node if you want:
                 if type(node.activate) == "function" then
                     log:warning("Activating node " .. name)
                     node:activate(1)
@@ -274,9 +297,6 @@ local function register_jack_hook()
                 return
             end
 
-            -- Case 2: Either we have a valid mapping, or there is no known base_default.
-            -- - If mapping exists: use it
-            -- - If no base_default: fall back to node.name (first-time / broken metadata)
             local target_name = mapped or name
 
             if target_name == current_default then
