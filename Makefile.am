@@ -17,9 +17,11 @@ install-exec-hook:
 
 install-data-hook:
 	mkdir -p $(DESTDIR)/usr/share/pipewire/pipewire.conf.d/
+	mkdir -p $(DESTDIR)/usr/share/pipewire/pipewire-pulse.conf.d/
 	mkdir -p $(DESTDIR)/usr/share/wireplumber/wireplumber.conf.d/
 	mkdir -p $(DESTDIR)/usr/share/wireplumber/scripts/
 	$(INSTALL_DATA) $(srcdir)/configs/pw-pal-plugin.conf $(DESTDIR)/usr/share/pipewire/pipewire.conf.d/
+	$(INSTALL_DATA) $(srcdir)/configs/pal-compress-offload-sink.conf $(DESTDIR)/usr/share/pipewire/pipewire-pulse.conf.d/
 	$(INSTALL_DATA) $(srcdir)/configs/60-disable-alsa.conf $(DESTDIR)/usr/share/wireplumber/wireplumber.conf.d/
 	$(INSTALL_DATA) $(srcdir)/configs/90-device-detection.conf  $(DESTDIR)/usr/share/wireplumber/wireplumber.conf.d/
 	$(INSTALL_DATA) $(srcdir)/configs/90-device-detection.lua  $(DESTDIR)/usr/share/wireplumber/scripts/
