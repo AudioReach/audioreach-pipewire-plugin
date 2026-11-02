@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -55,6 +56,8 @@ PW_LOG_TOPIC_STATIC(log_topic, "log:" LOG_TAG);
 #define PW_DEFAULT_SAMPLE_CHANNELS 2
 #define PW_DEFAULT_SAMPLE_POSITION "[ FL FR ]"
 #define PW_DEFAULT_BUFFER_DURATION_MS 25
+#define DOA_POLL_INTERVAL_MS 100
+#define WORD_LENGTH 7
 #define PW_LOW_LATENCY_BUFFER_DURATION_MS 5
 #define PW_DEEP_BUFFER_BUFFER_DURATION_MS 20
 #define MAX_NAME_LENGTH 20
@@ -186,6 +189,12 @@ struct pw_userdata {
     uint32_t props_serial;
     struct pw_impl_metadata *sva_metadata;   
     uint32_t sva_node_id;                    
+
+    /* FNN+ DOA polling via metadata */
+    struct pw_impl_metadata *doa_metadata;
+    struct spa_hook          doa_ctrl_listener;
+    struct spa_source       *doa_timer;
+    uint32_t                 doa_poll_interval_ms;
 };
 
 static void pw_pal_normalize_aac_config(struct pw_userdata *udata)
@@ -1857,6 +1866,8 @@ static const struct pw_proxy_events pw_pal_proxy_events_core = {
     .destroy = pw_pal_core_destroy,
 };
 
+static void doa_timer_set(struct pw_userdata *udata, bool enable);
+
 static void pw_pal_userdata_destroy(struct pw_userdata *udata)
 {
     close_pal_stream(udata);
@@ -1885,6 +1896,17 @@ static void pw_pal_userdata_destroy(struct pw_userdata *udata)
     }
     if (fcntl(udata->jack_fd, F_GETFD) != -1 || errno != EBADF)
         close(udata->jack_fd);
+    if (udata->doa_timer) {
+        doa_timer_set(udata, false);
+        pw_loop_destroy_source(pw_context_get_main_loop(udata->context),
+                               udata->doa_timer);
+        udata->doa_timer = NULL;
+    }
+    if (udata->doa_metadata) {
+        spa_hook_remove(&udata->doa_ctrl_listener);
+        pw_impl_metadata_destroy(udata->doa_metadata);
+        udata->doa_metadata = NULL;
+    }
     if (udata->core && udata->do_disconnect)
         pw_core_disconnect(udata->core);
     pw_properties_free(udata->stream_props);
@@ -2132,6 +2154,210 @@ static inline bool pw_stream_is_running(struct pw_userdata *udata)
 
     return st == PW_STREAM_STATE_STREAMING;
 }
+
+/* ═══════════════════════════════════════════════════════════════
+ * FNN+ DOA polling via PipeWire metadata
+ * ═══════════════════════════════════════════════════════════════ */
+
+static void doa_timer_set(struct pw_userdata *udata, bool enable)
+{
+    struct timespec ts = {
+        .tv_sec  = udata->doa_poll_interval_ms / 1000,
+        .tv_nsec = (long)(udata->doa_poll_interval_ms % 1000) * 1000000L,
+    };
+    pw_loop_update_timer(
+        pw_context_get_main_loop(udata->context),
+        udata->doa_timer,
+        enable ? &ts : NULL,
+        enable ? &ts : NULL,
+        false);
+    pw_log_info("DOA polling %s", enable ? "started" : "stopped");
+}
+
+static void doa_timer_cb(void *data, uint64_t expirations)
+{
+    struct pw_userdata *udata = data;
+    char buf[32];
+    char *abuf = NULL;
+    int abuf_len, pos, i;
+    pal_param_payload *get_payload = NULL;
+    struct pal_fnn_plus_doa_estimate_monitor_param_with_ts_t *config;
+    int16_t *polar_axis0, *angle_map_axis0, *polar_axis1, *angle_map_axis1;
+    uint16_t ax0_len, ax1_len;
+    uint64_t ts_us;
+    int ret;
+
+    (void)expirations;
+
+    if (!udata->stream_handle) {
+        pw_log_debug("doa_timer_cb: stream not running, skipping");
+        return;
+    }
+
+    ret = pal_stream_get_param(udata->stream_handle,
+                               PAL_PARAM_ID_FNN_PLUS_DOA_ESTIMATE_MONITOR_WITH_TIMESTAMP,
+                               &get_payload);
+    if (ret || !get_payload) {
+        pw_log_error("doa_timer_cb: pal_stream_get_param failed ret=%d", ret);
+        free(get_payload);
+        return;
+    }
+
+    config = (struct pal_fnn_plus_doa_estimate_monitor_param_with_ts_t *)
+             get_payload->payload;
+
+    /* Variable-length arrays start at offset 20 (sizeof(*config)).
+     * DSP sends ax0_len-4 real polar values before angle_map; we read 176 then
+     * pad 4 zeros to keep output at ax0_len. angle_map starts at +ax0_len-4. */
+    polar_axis0    = (int16_t *)((uint8_t *)config + sizeof(*config));
+    angle_map_axis0 = polar_axis0    + (config->polar_activity_axis0_length - 4);
+    polar_axis1    = angle_map_axis0 + config->polar_activity_axis0_length;
+    angle_map_axis1 = polar_axis1    + config->polar_activity_axis1_length;
+
+    snprintf(buf, sizeof(buf), "%d", (int)config->speech_probability_q15);
+    pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                  "fnn.doa.speech_prob", "Spa:Int", buf);
+
+    snprintf(buf, sizeof(buf), "%d", (int)config->current_talker_doa[0]);
+    pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                  "fnn.doa.degrees", "Spa:Int", buf);
+
+    snprintf(buf, sizeof(buf), "%u", (unsigned)config->polar_activity_axis0_length*2);
+    pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                  "fnn.doa.axis0_len", "Spa:Int", buf);
+
+    snprintf(buf, sizeof(buf), "%u", (unsigned)config->polar_activity_axis1_length);
+    pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                  "fnn.doa.axis1_len", "Spa:Int", buf);
+
+    ax0_len = config->polar_activity_axis0_length;
+    ax1_len = config->polar_activity_axis1_length;
+
+    if (ax0_len > 0) {
+        int real_len = (ax0_len >= 4) ? (int)ax0_len - 4 : (int)ax0_len;
+        abuf_len = (int)ax0_len * (WORD_LENGTH * 2) + 1;
+        abuf = malloc(abuf_len);
+        if (abuf) {
+            pos = 0;
+            /* real_len values from DSP, then pad 4 zeros to reach ax0_len */
+            for (i = 0; i < real_len; i++)
+                pos += snprintf(abuf + pos, abuf_len - pos,
+                                i ? " %d" : "%d", (int)polar_axis0[i]);
+            for (i = real_len; i < (int)ax0_len; i++)
+                pos += snprintf(abuf + pos, abuf_len - pos, " 0");
+            /* reversed copy: ax0_len-1 down to 0 */
+            for (i = (int)ax0_len - 1; i >= real_len; i--)
+                pos += snprintf(abuf + pos, abuf_len - pos, " 0");
+            for (i = real_len - 1; i >= 0; i--)
+                pos += snprintf(abuf + pos, abuf_len - pos,
+                                " %d", (int)polar_axis0[i]);
+            pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                          "fnn.doa.polar_axis0", "Spa:String", abuf);
+            free(abuf);
+            abuf = NULL;
+        }
+    } else {
+        pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                      "fnn.doa.polar_axis0", "Spa:String", "");
+    }
+
+    if (ax0_len > 0) {
+        abuf_len = (int)ax0_len * (WORD_LENGTH * 2) + 1;
+        abuf = malloc(abuf_len);
+        if (abuf) {
+            pos = 0;
+            for (i = 0; i < (int)ax0_len; i++)
+                pos += snprintf(abuf + pos, abuf_len - pos,
+                                i ? " %d" : "%d", (int)angle_map_axis0[i]);
+            /* reversed copy: ax0_len-1 down to 0 */
+            for (i = (int)ax0_len - 1; i >= 0; i--)
+                pos += snprintf(abuf + pos, abuf_len - pos,
+                                " %d", (int)angle_map_axis0[i]);
+            pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                          "fnn.doa.angle_map0", "Spa:String", abuf);
+            free(abuf);
+            abuf = NULL;
+        }
+    } else {
+        pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                      "fnn.doa.angle_map0", "Spa:String", "");
+    }
+
+    if (ax1_len > 0) {
+        abuf_len = (int)ax1_len * WORD_LENGTH + 1;
+        abuf = malloc(abuf_len);
+        if (abuf) {
+            pos = 0;
+            for (i = 0; i < (int)ax1_len; i++)
+                pos += snprintf(abuf + pos, abuf_len - pos,
+                                i ? " %d" : "%d", (int)polar_axis1[i]);
+            pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                          "fnn.doa.polar_axis1", "Spa:String", abuf);
+            free(abuf);
+            abuf = NULL;
+        }
+    } else {
+        pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                      "fnn.doa.polar_axis1", "Spa:String", "");
+    }
+
+    if (ax1_len > 0) {
+        abuf_len = (int)ax1_len * WORD_LENGTH + 1;
+        abuf = malloc(abuf_len);
+        if (abuf) {
+            pos = 0;
+            for (i = 0; i < (int)ax1_len; i++)
+                pos += snprintf(abuf + pos, abuf_len - pos,
+                                i ? " %d" : "%d", (int)angle_map_axis1[i]);
+            pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                          "fnn.doa.angle_map1", "Spa:String", abuf);
+            free(abuf);
+            abuf = NULL;
+        }
+    } else {
+        pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                      "fnn.doa.angle_map1", "Spa:String", "");
+    }
+
+    ts_us = ((uint64_t)config->session_time_msw << 32) | config->session_time_lsw;
+    snprintf(buf, sizeof(buf), "%" PRIu64, ts_us);
+    pw_impl_metadata_set_property(udata->doa_metadata, 0,
+                                  "fnn.doa.timestamp_us", "Spa:Long", buf);
+
+    free(get_payload);
+}
+
+static int on_doa_metadata_property(void *data, uint32_t subject,
+                                    const char *key, const char *type,
+                                    const char *value)
+{
+    struct pw_userdata *udata = data;
+    (void)subject; (void)type;
+
+    if (!key)
+        return 0;
+
+    if (spa_streq(key, "fnn.doa.enable")) {
+        bool enable = value && spa_streq(value, "1");
+        doa_timer_set(udata, enable);
+    } else if (spa_streq(key, "fnn.doa.interval_ms")) {
+        if (value) {
+            uint32_t ms = (uint32_t)atoi(value);
+            if (ms > 0) {
+                udata->doa_poll_interval_ms = ms;
+                /* restart timer with new interval if already running */
+                if (udata->doa_timer)
+                    doa_timer_set(udata, true);
+            }
+        }
+    }
+    return 0;
+}
+
+static const struct pw_metadata_events doa_ctrl_events = {
+    PW_VERSION_METADATA_EVENTS,
+    .property = on_doa_metadata_property,
+};
 
 static int handle_device_connection(struct pw_userdata *udata, bool state)
 {
@@ -2630,6 +2856,29 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
     if ((res = pw_pal_create_stream(udata)) < 0)
         goto error;
     pw_impl_module_add_listener(module, &udata->module_listener, &pw_pal_events_module, udata);
+
+    /* Create FNN+ DOA metadata object only for capture (VA) instances.
+     * Playback instances have no FNN stream handle so pal_stream_get_param
+     * would always fail with -EINVAL. */
+    if (!udata->isplayback) {
+        udata->doa_metadata = pw_context_create_metadata(udata->context,
+                                                         "fnn-doa", NULL, 0);
+        if (udata->doa_metadata) {
+            pw_impl_metadata_register(udata->doa_metadata, NULL);
+            struct pw_metadata *m = pw_impl_metadata_get_implementation(
+                                        udata->doa_metadata);
+            pw_metadata_add_listener(m, &udata->doa_ctrl_listener,
+                                     &doa_ctrl_events, udata);
+            udata->doa_poll_interval_ms = DOA_POLL_INTERVAL_MS;
+            udata->doa_timer = pw_loop_add_timer(
+                pw_context_get_main_loop(udata->context),
+                doa_timer_cb, udata);
+            pw_log_info("FNN+ DOA metadata and timer created");
+        } else {
+            pw_log_error("failed to create fnn-doa metadata");
+        }
+    }
+
     if (udata->jack_name && udata->jack_name[0] != '\0') {
         if(jack_register(udata))
             pw_log_error("failed to register jack event for %s", udata->jack_name);
