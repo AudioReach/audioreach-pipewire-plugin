@@ -2424,6 +2424,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
             udata->pal_device_id[0] = PAL_DEVICE_IN_WIRED_HEADSET;
         else if (strstr(value, "pal_sink_dp_out"))
             udata->pal_device_id[0] = PAL_DEVICE_OUT_AUX_DIGITAL;
+        else if (strstr(value, "pal_sink_dp1_out"))
+            udata->pal_device_id[0] = PAL_DEVICE_OUT_AUX_DIGITAL_1;
         else if (strstr(value, "pal_sink_hdmi_out"))
             udata->pal_device_id[0] = PAL_DEVICE_OUT_HDMI;
         else if (strstr(value, "pal_sink_combined")) {
