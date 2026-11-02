@@ -2062,6 +2062,10 @@ static void pw_pal_fill_stream_info(struct pw_userdata *udata)
         }
     } else {
         udata->stream_attributes->direction = PAL_AUDIO_INPUT;
+        if (udata->stream_type == PAL_STREAM_RAW) {
+            udata->stream_attributes->info.opt_stream_info.version      = 1;
+            udata->stream_attributes->info.opt_stream_info.isBitPerfect = true;
+        }
         if (!udata->is_sva) {
             udata->stream_attributes->in_media_config.sample_rate = udata->info.rate;
             udata->stream_attributes->in_media_config.bit_width = 16;
@@ -2418,6 +2422,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
             udata->pal_device_id[0] = PAL_DEVICE_OUT_SPEAKER;
         else if (strstr(value, "pal_sink_headset"))
             udata->pal_device_id[0] = PAL_DEVICE_OUT_WIRED_HEADSET;
+        else if (strstr(value, "pal_source_speaker_mic_raw"))
+            udata->pal_device_id[0] = PAL_DEVICE_IN_SPEAKER_MIC;
         else if (strstr(value, "pal_source_speaker_mic"))
             udata->pal_device_id[0] = PAL_DEVICE_IN_SPEAKER_MIC;
         else if (strstr(value, "pal_source_headset_mic"))
@@ -2454,6 +2460,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
                 udata->stream_type = PAL_STREAM_DEEP_BUFFER;
             else
                 udata->stream_type = PAL_STREAM_LOW_LATENCY;
+    } else if (role && !udata->isplayback && strstr(role, "raw")) {
+        udata->stream_type = PAL_STREAM_RAW;
     } else {
         udata->stream_type = PAL_STREAM_DEEP_BUFFER;
     }
