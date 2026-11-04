@@ -35,6 +35,7 @@
 #include <pipewire/i18n.h>
 #include <PalApi.h>
 #include <PalDefs.h>
+#include "fnn_plus_calibration_api_fvxv.h"
 #include <agm/agm_api.h>
 #include <pthread.h>
 #include "SoundTriggerUtils.h"
@@ -1944,7 +1945,7 @@ static void doa_timer_cb(void *data, uint64_t expirations)
     char *abuf = NULL;
     int abuf_len, pos, i;
     pal_param_payload *get_payload = NULL;
-    struct pal_fnn_plus_doa_estimate_monitor_param_with_ts_t *config;
+    struct fnn_plus_doa_estimate_monitor_param_with_ts_t *config;
     int16_t *polar_axis0, *angle_map_axis0, *polar_axis1, *angle_map_axis1;
     uint16_t ax0_len, ax1_len;
     uint64_t ts_us;
@@ -1966,7 +1967,7 @@ static void doa_timer_cb(void *data, uint64_t expirations)
         return;
     }
 
-    config = (struct pal_fnn_plus_doa_estimate_monitor_param_with_ts_t *)
+    config = (struct fnn_plus_doa_estimate_monitor_param_with_ts_t *)
              get_payload->payload;
 
     /* Variable-length arrays start at offset 20 (sizeof(*config)).
